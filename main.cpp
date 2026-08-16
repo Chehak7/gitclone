@@ -482,6 +482,11 @@ public:
 //       └── heads/      ← one file per branch containing a commit hash
 //           └── master  ← e.g., "abc123...\n"
 
+class Repository {
+public:
+class Repository {
+};
+
 int main(int argc, char* argv[]) {
     return 0;
 }
