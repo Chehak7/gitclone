@@ -485,6 +485,679 @@ public:
 class Repository {
 public:
 class Repository {
+    bool init() {
+        if (fs::exists(git_dir)) {
+            return false;
+        }
+
+        fs::create_directory(git_dir);
+        fs::create_directory(objects_dir);
+        fs::create_directory(ref_dir);
+        fs::create_directories(heads_dir);
+
+        write_file_text(head_file, "ref: refs/heads/master\n");
+        save_index({});
+
+        std::cout << "Initialized empty Git repository in " << git_dir
+                  << std::endl;
+        return true;
+    }
+    std::string store_object(const GitObject& obj) {
+        std::string obj_hash = obj.compute_hash();
+
+        fs::path obj_dir = objects_dir / obj_hash.substr(0, 2);
+        fs::path obj_file = obj_dir / obj_hash.substr(2);
+
+        if (!fs::exists(obj_file)) {
+            fs::create_directories(obj_dir);
+            write_file_bytes(obj_file, obj.serialize());
+        }
+
+        return obj_hash;
+    }
+    GitObject load_object(const std::string& obj_hash) {
+        fs::path obj_dir = objects_dir / obj_hash.substr(0, 2);
+        fs::path obj_file = obj_dir / obj_hash.substr(2);
+
+        if (!fs::exists(obj_file)) {
+            throw std::runtime_error("Object " + obj_hash + " not found");
+        }
+
+        return GitObject::deserialize(read_file_bytes(obj_file));
+    }
+    std::map<std::string, std::string> load_index() {
+        if (!fs::exists(index_file)) {
+            return {};
+        }
+        try {
+            std::string text = read_file_text(index_file);
+            return index_deserialize(text);
+        } catch (...) {
+            return {};
+        }
+    }
+    void save_index(const std::map<std::string, std::string>& index) {
+        write_file_text(index_file, index_serialize(index));
+    }
+    void add_file(const std::string& path) {
+        fs::path full_path = repo_path / path;
+        if (!fs::exists(full_path)) {
+            throw std::runtime_error("Path " + path + " not found");
+        }
+
+        std::vector<uint8_t> file_content = read_file_bytes(full_path);
+        Blob blob(file_content);
+        std::string blob_hash = store_object(blob);
+
+        auto index = load_index();
+        index[path] = blob_hash;
+        save_index(index);
+
+        std::cout << "Added " << path << std::endl;
+    }
+    void add_directory(const std::string& path) {
+        fs::path full_path = repo_path / path;
+        if (!fs::exists(full_path)) {
+            throw std::runtime_error("Directory " + path + " not found");
+        }
+        if (!fs::is_directory(full_path)) {
+            throw std::runtime_error(path + " is not a directory");
+        }
+
+        auto index = load_index();
+        int added_count = 0;
+
+        for (const auto& entry :
+             fs::recursive_directory_iterator(full_path)) {
+            if (!entry.is_regular_file()) continue;
+
+            bool in_git = false;
+            for (const auto& component : entry.path()) {
+                if (component.string() == ".git") {
+                    in_git = true;
+                    break;
+                }
+            }
+            if (in_git) continue;
+
+            std::vector<uint8_t> file_content =
+                read_file_bytes(entry.path());
+            Blob blob(file_content);
+            std::string blob_hash = store_object(blob);
+
+            std::string rel_path =
+                fs::relative(entry.path(), repo_path).string();
+            index[rel_path] = blob_hash;
+            ++added_count;
+        }
+
+        save_index(index);
+
+        if (added_count > 0) {
+            std::cout << "Added " << added_count << " files from directory "
+                      << path << std::endl;
+        } else {
+            std::cout << "Directory " << path << " already up to date"
+                      << std::endl;
+        }
+    }
+    void add_path(const std::string& path) {
+        fs::path full_path = repo_path / path;
+
+        if (!fs::exists(full_path)) {
+            throw std::runtime_error("Path " + path + " not found");
+        }
+
+        if (fs::is_regular_file(full_path)) {
+            add_file(path);
+        } else if (fs::is_directory(full_path)) {
+            add_directory(path);
+        } else {
+            throw std::runtime_error(
+                path + " is neither a file nor a directory");
+        }
+    }
+    struct EntryValue {
+        std::string hash;                              // non-empty = file
+        std::map<std::string, EntryValue> children;    // non-empty = dir
+
+        bool is_file() const { return !hash.empty(); }
+    };
+    std::string create_tree_from_index() {
+        auto index = load_index();
+        if (index.empty()) {
+            Tree tree;
+            return store_object(tree);
+        }
+
+        std::map<std::string, EntryValue> root;
+
+        for (const auto& [file_path, blob_hash] : index) {
+            auto parts = split(file_path, "/");
+
+            if (parts.size() == 1) {
+                root[parts[0]].hash = blob_hash;
+            } else {
+                auto* current = &root[parts[0]];
+                for (size_t i = 1; i + 1 < parts.size(); ++i) {
+                    current = &current->children[parts[i]];
+                }
+                current->children[parts.back()].hash = blob_hash;
+            }
+        }
+
+        std::function<std::string(const std::map<std::string, EntryValue>&)>
+            create_tree_recursive;
+        create_tree_recursive =
+            [&](const std::map<std::string, EntryValue>& entries)
+                -> std::string {
+            Tree tree;
+            for (const auto& [name, entry] : entries) {
+                if (entry.is_file()) {
+                    tree.add_entry("100644", name, entry.hash);
+                } else {
+                    std::string subtree_hash =
+                        create_tree_recursive(entry.children);
+                    tree.add_entry("40000", name, subtree_hash);
+                }
+            }
+            return store_object(tree);
+        };
+
+        return create_tree_recursive(root);
+    }
+                              "CppGit User <user@cppgit.com>") {
+        std::string tree_hash = create_tree_from_index();
+
+        std::string current_branch = get_current_branch();
+        std::string parent_commit = get_branch_commit(current_branch);
+        std::vector<std::string> parent_hashes;
+        if (!parent_commit.empty()) {
+            parent_hashes.push_back(parent_commit);
+        }
+
+        auto index = load_index();
+        if (index.empty()) {
+            std::cout << "nothing to commit, working tree clean" << std::endl;
+            return "";
+        }
+
+        if (!parent_commit.empty()) {
+            GitObject parent_obj = load_object(parent_commit);
+            Commit parent_data = Commit::from_content(parent_obj.content);
+            if (tree_hash == parent_data.tree_hash) {
+                std::cout << "nothing to commit, working tree clean"
+                          << std::endl;
+                return "";
+            }
+        }
+
+        Commit commit_obj(tree_hash, parent_hashes, author, author, message);
+        std::string commit_hash = store_object(commit_obj);
+
+        set_branch_commit(current_branch, commit_hash);
+
+        // Keep this reset in mind: status and dirty checks fall back to the
+        // committed tree when the index is empty.
+        save_index({});
+
+        std::cout << "Created commit " << commit_hash << " on branch "
+                  << current_branch << std::endl;
+        return commit_hash;
+    }
+        const std::string& tree_hash, const std::string& prefix = "") {
+        std::set<std::string> files;
+        try {
+            GitObject tree_obj = load_object(tree_hash);
+            Tree tree = Tree::from_content(tree_obj.content);
+
+            for (const auto& entry : tree.entries) {
+                std::string full_name = prefix + entry.name;
+                if (entry.mode.size() >= 3 &&
+                    entry.mode.substr(0, 3) == "100") {
+                    files.insert(full_name);
+                } else if (entry.mode.size() >= 3 &&
+                           entry.mode.substr(0, 3) == "400") {
+                    auto subtree_files = get_files_from_tree_recursive(
+                        entry.obj_hash, full_name + "/");
+                    files.insert(subtree_files.begin(), subtree_files.end());
+                }
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "Warning: Could not read tree " << tree_hash
+                      << ": " << e.what() << std::endl;
+        }
+        return files;
+    }
+        const std::string& tree_hash, const std::string& prefix = "") {
+        std::map<std::string, std::string> index;
+        try {
+            GitObject tree_obj = load_object(tree_hash);
+            Tree tree = Tree::from_content(tree_obj.content);
+
+            for (const auto& entry : tree.entries) {
+                std::string full_name = prefix + entry.name;
+                if (entry.mode.size() >= 3 &&
+                    entry.mode.substr(0, 3) == "100") {
+                    index[full_name] = entry.obj_hash;
+                } else if (entry.mode.size() >= 3 &&
+                           entry.mode.substr(0, 3) == "400") {
+                    auto subindex = build_index_from_tree(
+                        entry.obj_hash, full_name + "/");
+                    index.insert(subindex.begin(), subindex.end());
+                }
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "Warning: Could not read tree " << tree_hash
+                      << ": " << e.what() << std::endl;
+        }
+        return index;
+    }
+        const std::string& commit_hash) {
+        if (commit_hash.empty()) return {};
+        GitObject obj = load_object(commit_hash);
+        Commit commit = Commit::from_content(obj.content);
+        return commit.tree_hash.empty()
+            ? std::map<std::string, std::string>{}
+            : build_index_from_tree(commit.tree_hash);
+    }
+    std::vector<std::string> get_dirty_files() {
+        std::string head = get_branch_commit(get_current_branch());
+        auto committed_files = files_for_commit(head);
+        auto index = load_index();
+        std::vector<std::string> dirty_files;
+
+        for (const auto& [fp, idx_hash] : index) {
+            auto it = committed_files.find(fp);
+            if (it == committed_files.end() || it->second != idx_hash) {
+                dirty_files.push_back(fp);
+            }
+        }
+
+        auto expected_files = committed_files;
+        for (const auto& [fp, idx_hash] : index) {
+            expected_files[fp] = idx_hash;
+        }
+        for (const auto& [fp, expected_hash] : expected_files) {
+            fs::path full = repo_path / fp;
+            if (!fs::is_regular_file(full)) {
+                dirty_files.push_back(fp);
+                continue;
+            }
+            Blob blob(read_file_bytes(full));
+            if (blob.compute_hash() != expected_hash) {
+                dirty_files.push_back(fp);
+            }
+        }
+
+        std::sort(dirty_files.begin(), dirty_files.end());
+        dirty_files.erase(std::unique(dirty_files.begin(), dirty_files.end()),
+                          dirty_files.end());
+        return dirty_files;
+    }
+    void restore_tree(const std::string& tree_hash, const fs::path& path) {
+        GitObject tree_obj = load_object(tree_hash);
+        Tree tree = Tree::from_content(tree_obj.content);
+
+        for (const auto& entry : tree.entries) {
+            fs::path file_path = path / entry.name;
+
+            if (entry.mode.size() >= 3 &&
+                entry.mode.substr(0, 3) == "100") {
+                GitObject blob_obj = load_object(entry.obj_hash);
+                write_file_bytes(file_path, blob_obj.content);
+            } else if (entry.mode.size() >= 3 &&
+                       entry.mode.substr(0, 3) == "400") {
+                fs::create_directories(file_path);
+                restore_tree(entry.obj_hash, file_path);
+            }
+        }
+    }
+                                   const std::set<std::string>& files_to_clear) {
+        std::string target_commit_hash = get_branch_commit(branch);
+        if (target_commit_hash.empty()) return;
+
+        for (const auto& rel_path : files_to_clear) {
+            fs::path file_path = repo_path / rel_path;
+            try {
+                if (fs::is_regular_file(file_path)) {
+                    fs::remove(file_path);
+                }
+            } catch (...) {}
+        }
+
+        GitObject target_obj = load_object(target_commit_hash);
+        Commit target_commit = Commit::from_content(target_obj.content);
+
+        if (!target_commit.tree_hash.empty()) {
+            restore_tree(target_commit.tree_hash, repo_path);
+        }
+
+        save_index({});
+    }
+                                     const std::string& target_hash) {
+        std::set<std::string> current_ancestors;
+        std::vector<std::string> pending{current_hash};
+        for (size_t i = 0; i < pending.size(); ++i) {
+            const std::string hash = pending[i];
+            if (hash.empty() || !current_ancestors.insert(hash).second) continue;
+            Commit commit = Commit::from_content(load_object(hash).content);
+            pending.insert(pending.end(), commit.parent_hashes.begin(),
+                           commit.parent_hashes.end());
+        }
+
+        std::set<std::string> seen;
+        pending = {target_hash};
+        for (size_t i = 0; i < pending.size(); ++i) {
+            const std::string hash = pending[i];
+            if (hash.empty() || !seen.insert(hash).second) continue;
+            if (current_ancestors.count(hash) != 0) return hash;
+            Commit commit = Commit::from_content(load_object(hash).content);
+            pending.insert(pending.end(), commit.parent_hashes.begin(),
+                           commit.parent_hashes.end());
+        }
+        return "";
+    }
+        const std::set<std::string>& files_to_clear) {
+        for (const auto& fp : files_to_clear) {
+            fs::path path = repo_path / fp;
+            if (fs::is_regular_file(path)) fs::remove(path);
+        }
+        for (const auto& [fp, hash] : files) {
+            fs::path path = repo_path / fp;
+            if (!path.parent_path().empty()) {
+                fs::create_directories(path.parent_path());
+            }
+            write_file_bytes(path, load_object(hash).content);
+        }
+    }
+    bool merge(const std::string& target_branch) {
+        std::string current_branch = get_current_branch();
+        std::string current_hash = get_branch_commit(current_branch);
+        std::string target_hash = get_branch_commit(target_branch);
+        if (target_hash.empty()) {
+            std::cerr << "merge: " << target_branch << " - not something we can merge"
+                      << std::endl;
+            return false;
+        }
+        if (current_hash.empty()) {
+            std::cerr << "merge: current branch has no commits" << std::endl;
+            return false;
+        }
+        if (!require_clean_working_tree("merge")) return false;
+
+        std::string ancestor_hash = find_common_ancestor(current_hash, target_hash);
+        if (ancestor_hash.empty()) {
+            std::cerr << "fatal: refusing to merge unrelated histories"
+                      << std::endl;
+            return false;
+        }
+        if (target_hash == ancestor_hash) {
+            std::cout << "Already up to date." << std::endl;
+            return true;
+        }
+
+        auto current_files = files_for_commit(current_hash);
+        auto target_files = files_for_commit(target_hash);
+        std::set<std::string> files_to_clear;
+        for (const auto& [fp, hash] : current_files) {
+            (void)hash;
+            files_to_clear.insert(fp);
+        }
+        for (const auto& [fp, hash] : target_files) {
+            (void)hash;
+            files_to_clear.insert(fp);
+        }
+
+        if (current_hash == ancestor_hash) {
+            write_working_files(target_files, files_to_clear);
+            set_branch_commit(current_branch, target_hash);
+            save_index({});
+            std::cout << "Fast-forward" << std::endl;
+            return true;
+        }
+
+        auto ancestor_files = files_for_commit(ancestor_hash);
+        std::set<std::string> all_paths;
+        for (const auto& [fp, hash] : ancestor_files) {
+            (void)hash;
+            all_paths.insert(fp);
+        }
+        for (const auto& [fp, hash] : current_files) {
+            (void)hash;
+            all_paths.insert(fp);
+        }
+        for (const auto& [fp, hash] : target_files) {
+            (void)hash;
+            all_paths.insert(fp);
+        }
+
+        auto hash_at = [](const std::map<std::string, std::string>& files,
+                          const std::string& path) {
+            auto it = files.find(path);
+            return it == files.end() ? std::string{} : it->second;
+        };
+        std::map<std::string, std::string> merged_files;
+        std::vector<std::string> conflicts;
+        for (const auto& fp : all_paths) {
+            std::string ancestor = hash_at(ancestor_files, fp);
+            std::string current = hash_at(current_files, fp);
+            std::string target = hash_at(target_files, fp);
+            std::string result;
+
+            if (current == target) {
+                result = current;
+            } else if (current == ancestor) {
+                result = target;
+            } else if (target == ancestor) {
+                result = current;
+            } else {
+                conflicts.push_back(fp);
+                continue;
+            }
+            if (!result.empty()) merged_files[fp] = result;
+        }
+
+        write_working_files(merged_files, files_to_clear);
+        if (!conflicts.empty()) {
+            for (const auto& fp : conflicts) {
+                std::string current_hash_for_file = hash_at(current_files, fp);
+                std::string target_hash_for_file = hash_at(target_files, fp);
+                std::string current_text;
+                std::string target_text;
+                if (!current_hash_for_file.empty()) {
+                    auto bytes = load_object(current_hash_for_file).content;
+                    current_text.assign(bytes.begin(), bytes.end());
+                }
+                if (!target_hash_for_file.empty()) {
+                    auto bytes = load_object(target_hash_for_file).content;
+                    target_text.assign(bytes.begin(), bytes.end());
+                }
+                fs::path path = repo_path / fp;
+                fs::create_directories(path.parent_path());
+                std::string contents = "<<<<<<< HEAD\n" + current_text;
+                if (!current_text.empty() && current_text.back() != '\n') contents += "\n";
+                contents += "=======\n" + target_text;
+                if (!target_text.empty() && target_text.back() != '\n') contents += "\n";
+                contents += ">>>>>>> " + target_branch + "\n";
+                write_file_text(path, contents);
+            }
+            save_index({});
+            std::cout << "CONFLICT (content): Merge conflict in:" << std::endl;
+            for (const auto& fp : conflicts) std::cout << "    " << fp << std::endl;
+            std::cout << "Automatic merge failed; fix conflicts and then commit the result."
+                      << std::endl;
+            return false;
+        }
+
+        save_index(merged_files);
+        std::string tree_hash = create_tree_from_index();
+        std::string author = "CppGit User <user@cppgit.com>";
+        Commit commit(tree_hash, {current_hash, target_hash}, author, author,
+                      "Merge branch '" + target_branch + "'");
+        std::string merge_hash = store_object(commit);
+        set_branch_commit(current_branch, merge_hash);
+        save_index({});
+        std::cout << "Merge made commit " << merge_hash << std::endl;
+        return true;
+    }
+    void log(int max_count = 10) {
+        std::string current_branch = get_current_branch();
+        std::string commit_hash = get_branch_commit(current_branch);
+
+        if (commit_hash.empty()) {
+            std::cout << "No commits yet!" << std::endl;
+            return;
+        }
+
+        int count = 0;
+        while (!commit_hash.empty() && count < max_count) {
+            GitObject commit_obj = load_object(commit_hash);
+            Commit c = Commit::from_content(commit_obj.content);
+
+            std::cout << "commit " << commit_hash << std::endl;
+            std::cout << "Author: " << c.author << std::endl;
+
+            std::time_t t = static_cast<std::time_t>(c.timestamp);
+            std::cout << "Date: " << std::ctime(&t);  // ctime adds \n
+            std::cout << "\n    " << c.message << "\n" << std::endl;
+
+            commit_hash = c.parent_hashes.empty() ? "" : c.parent_hashes[0];
+            ++count;
+        }
+    }
+    void status() {
+        std::string current_branch = get_current_branch();
+        std::cout << "On branch " << current_branch << std::endl;
+
+        auto index = load_index();
+        std::string current_commit_hash = get_branch_commit(current_branch);
+
+        std::map<std::string, std::string> last_index_files;
+        if (!current_commit_hash.empty()) {
+            try {
+                GitObject commit_obj = load_object(current_commit_hash);
+                Commit c = Commit::from_content(commit_obj.content);
+                if (!c.tree_hash.empty()) {
+                    last_index_files = build_index_from_tree(c.tree_hash);
+                }
+            } catch (...) {
+                last_index_files.clear();
+            }
+        }
+
+        std::map<std::string, std::string> working_files;
+        for (const auto& file : get_all_files()) {
+            std::string rel_path =
+                fs::relative(file, repo_path).string();
+            try {
+                auto file_content = read_file_bytes(file);
+                Blob blob(file_content);
+                working_files[rel_path] = blob.compute_hash();
+            } catch (...) {
+                continue;
+            }
+        }
+
+        std::vector<std::pair<std::string, std::string>> staged_files;
+
+        std::set<std::string> all_index_paths;
+        for (const auto& [k, v] : index) {
+            (void)v;
+            all_index_paths.insert(k);
+        }
+        for (const auto& [k, v] : last_index_files) {
+            (void)v;
+            all_index_paths.insert(k);
+        }
+
+        for (const auto& file_path : all_index_paths) {
+            auto idx_it = index.find(file_path);
+            auto last_it = last_index_files.find(file_path);
+
+            std::string index_hash =
+                (idx_it != index.end()) ? idx_it->second : "";
+            std::string last_hash =
+                (last_it != last_index_files.end()) ? last_it->second : "";
+
+            if (!index_hash.empty() && last_hash.empty()) {
+                staged_files.push_back({"new file", file_path});
+            } else if (!index_hash.empty() && !last_hash.empty() &&
+                       index_hash != last_hash) {
+                staged_files.push_back({"modified", file_path});
+            }
+        }
+
+        if (!staged_files.empty()) {
+            std::sort(staged_files.begin(), staged_files.end());
+            std::cout << "\nChanges to be committed:" << std::endl;
+            for (const auto& [stage_status, fp] : staged_files) {
+                std::cout << "   " << stage_status << ": " << fp << std::endl;
+            }
+        }
+
+        // A staged entry overrides the committed baseline for that path.
+        auto expected_files = last_index_files;
+        for (const auto& [fp, idx_hash] : index) {
+            expected_files[fp] = idx_hash;
+        }
+
+        std::vector<std::string> unstaged_files;
+        for (const auto& [fp, wf_hash] : working_files) {
+            auto expected_it = expected_files.find(fp);
+            if (expected_it != expected_files.end() &&
+                wf_hash != expected_it->second) {
+                unstaged_files.push_back(fp);
+            }
+        }
+
+        if (!unstaged_files.empty()) {
+            std::sort(unstaged_files.begin(), unstaged_files.end());
+            std::cout << "\nChanges not staged for commit:" << std::endl;
+            for (const auto& fp : unstaged_files) {
+                std::cout << "   modified: " << fp << std::endl;
+            }
+        }
+
+        std::vector<std::string> untracked_files;
+        for (const auto& [fp, wf_hash] : working_files) {
+            (void)wf_hash;
+            if (index.find(fp) == index.end() &&
+                last_index_files.find(fp) == last_index_files.end()) {
+                untracked_files.push_back(fp);
+            }
+        }
+
+        if (!untracked_files.empty()) {
+            std::sort(untracked_files.begin(), untracked_files.end());
+            std::cout << "\nUntracked files:" << std::endl;
+            for (const auto& fp : untracked_files) {
+                std::cout << "   " << fp << std::endl;
+            }
+        }
+
+        std::vector<std::string> deleted_files;
+        for (const auto& [fp, expected_hash] : expected_files) {
+            (void)expected_hash;
+            if (working_files.find(fp) == working_files.end()) {
+                deleted_files.push_back(fp);
+            }
+        }
+
+        if (!deleted_files.empty()) {
+            std::sort(deleted_files.begin(), deleted_files.end());
+            std::cout << "\nDeleted files:" << std::endl;
+            for (const auto& fp : deleted_files) {
+                std::cout << "   deleted: " << fp << std::endl;
+            }
+        }
+
+        if (staged_files.empty() && unstaged_files.empty() &&
+            deleted_files.empty() && untracked_files.empty()) {
+            std::cout << "\nnothing to commit, working tree clean"
+                      << std::endl;
+        }
+    }
 };
 
 int main(int argc, char* argv[]) {
