@@ -484,7 +484,23 @@ public:
 
 class Repository {
 public:
-class Repository {
+    fs::path repo_path;
+    fs::path git_dir;
+    fs::path objects_dir;
+    fs::path ref_dir;
+    fs::path heads_dir;
+    fs::path head_file;
+    fs::path index_file;
+
+    explicit Repository(const std::string& path = ".")
+        : repo_path(fs::absolute(path)),
+          git_dir(repo_path / ".git"),
+          objects_dir(git_dir / "objects"),
+          ref_dir(git_dir / "refs"),
+          heads_dir(ref_dir / "heads"),
+          head_file(git_dir / "HEAD"),
+          index_file(git_dir / "index") {}
+
     bool init() {
         if (fs::exists(git_dir)) {
             return false;
@@ -502,6 +518,9 @@ class Repository {
                   << std::endl;
         return true;
     }
+
+    // Same two-character fan-out Git uses; a flat objects/ directory gets
+    // unwieldy surprisingly quickly.
     std::string store_object(const GitObject& obj) {
         std::string obj_hash = obj.compute_hash();
 
@@ -515,6 +534,7 @@ class Repository {
 
         return obj_hash;
     }
+
     GitObject load_object(const std::string& obj_hash) {
         fs::path obj_dir = objects_dir / obj_hash.substr(0, 2);
         fs::path obj_file = obj_dir / obj_hash.substr(2);
@@ -525,6 +545,7 @@ class Repository {
 
         return GitObject::deserialize(read_file_bytes(obj_file));
     }
+
     std::map<std::string, std::string> load_index() {
         if (!fs::exists(index_file)) {
             return {};
@@ -536,9 +557,11 @@ class Repository {
             return {};
         }
     }
+
     void save_index(const std::map<std::string, std::string>& index) {
         write_file_text(index_file, index_serialize(index));
     }
+
     void add_file(const std::string& path) {
         fs::path full_path = repo_path / path;
         if (!fs::exists(full_path)) {
@@ -555,6 +578,7 @@ class Repository {
 
         std::cout << "Added " << path << std::endl;
     }
+
     void add_directory(const std::string& path) {
         fs::path full_path = repo_path / path;
         if (!fs::exists(full_path)) {
@@ -601,6 +625,7 @@ class Repository {
                       << std::endl;
         }
     }
+
     void add_path(const std::string& path) {
         fs::path full_path = repo_path / path;
 
@@ -617,12 +642,14 @@ class Repository {
                 path + " is neither a file nor a directory");
         }
     }
+
     struct EntryValue {
         std::string hash;                              // non-empty = file
         std::map<std::string, EntryValue> children;    // non-empty = dir
 
         bool is_file() const { return !hash.empty(); }
     };
+
     std::string create_tree_from_index() {
         auto index = load_index();
         if (index.empty()) {
@@ -666,6 +693,37 @@ class Repository {
 
         return create_tree_recursive(root);
     }
+
+    // HEAD normally contains "ref: refs/heads/<branch>\n"; the ref itself
+    // stores the commit hash.
+    std::string get_current_branch() {
+        if (!fs::exists(head_file)) return "master";
+
+        std::string head_content = trim(read_file_text(head_file));
+        std::string prefix = "ref: refs/heads/";
+        if (head_content.size() >= prefix.size() &&
+            head_content.substr(0, prefix.size()) == prefix) {
+            return head_content.substr(prefix.size());
+        }
+        return "HEAD";  // Detached HEAD state
+    }
+
+    std::string get_branch_commit(const std::string& branch) {
+        fs::path branch_file = heads_dir / branch;
+        if (fs::exists(branch_file)) {
+            return trim(read_file_text(branch_file));
+        }
+        return "";
+    }
+
+    void set_branch_commit(const std::string& branch,
+                           const std::string& commit_hash) {
+        fs::path branch_file = heads_dir / branch;
+        write_file_text(branch_file, commit_hash + "\n");
+    }
+
+    std::string do_commit(const std::string& message,
+                          const std::string& author =
                               "CppGit User <user@cppgit.com>") {
         std::string tree_hash = create_tree_from_index();
 
@@ -705,6 +763,8 @@ class Repository {
                   << current_branch << std::endl;
         return commit_hash;
     }
+
+    std::set<std::string> get_files_from_tree_recursive(
         const std::string& tree_hash, const std::string& prefix = "") {
         std::set<std::string> files;
         try {
@@ -729,6 +789,8 @@ class Repository {
         }
         return files;
     }
+
+    std::map<std::string, std::string> build_index_from_tree(
         const std::string& tree_hash, const std::string& prefix = "") {
         std::map<std::string, std::string> index;
         try {
@@ -753,6 +815,8 @@ class Repository {
         }
         return index;
     }
+
+    std::map<std::string, std::string> files_for_commit(
         const std::string& commit_hash) {
         if (commit_hash.empty()) return {};
         GitObject obj = load_object(commit_hash);
@@ -761,6 +825,7 @@ class Repository {
             ? std::map<std::string, std::string>{}
             : build_index_from_tree(commit.tree_hash);
     }
+
     std::vector<std::string> get_dirty_files() {
         std::string head = get_branch_commit(get_current_branch());
         auto committed_files = files_for_commit(head);
@@ -795,6 +860,62 @@ class Repository {
                           dirty_files.end());
         return dirty_files;
     }
+
+    bool require_clean_working_tree(const std::string& operation) {
+        auto dirty_files = get_dirty_files();
+        if (dirty_files.empty()) return true;
+
+        std::cerr << "error: Your local changes to the following files "
+                     "would be overwritten by " << operation << ":"
+                  << std::endl;
+        for (const auto& fp : dirty_files) {
+            std::cerr << "    " << fp << std::endl;
+        }
+        std::cerr << "Please commit your changes or stash them before you "
+                     "continue." << std::endl;
+        return false;
+    }
+
+    // Check first; restoring another tree can overwrite tracked files.
+    void checkout(const std::string& branch, bool create_branch) {
+        std::string previous_branch = get_current_branch();
+        std::string previous_commit_hash = get_branch_commit(previous_branch);
+        auto committed_files = files_for_commit(previous_commit_hash);
+        std::set<std::string> files_to_clear;
+        for (const auto& [fp, hash] : committed_files) {
+            (void)hash;
+            files_to_clear.insert(fp);
+        }
+
+        if (!require_clean_working_tree("checkout")) return;
+
+        fs::path branch_file = heads_dir / branch;
+        if (!fs::exists(branch_file)) {
+            if (create_branch) {
+                if (!previous_commit_hash.empty()) {
+                    set_branch_commit(branch, previous_commit_hash);
+                    std::cout << "Created new branch " << branch << std::endl;
+                } else {
+                    std::cout << "No commits yet, cannot create a branch"
+                              << std::endl;
+                    return;
+                }
+            } else {
+                std::cout << "Branch '" << branch << "' not found."
+                          << std::endl;
+                std::cout << "Use './mygit checkout -b " << branch
+                          << "' to create and switch to a new branch."
+                          << std::endl;
+                return;
+            }
+        }
+
+        write_file_text(head_file, "ref: refs/heads/" + branch + "\n");
+
+        restore_working_directory(branch, files_to_clear);
+        std::cout << "Switched to branch " << branch << std::endl;
+    }
+
     void restore_tree(const std::string& tree_hash, const fs::path& path) {
         GitObject tree_obj = load_object(tree_hash);
         Tree tree = Tree::from_content(tree_obj.content);
@@ -813,6 +934,8 @@ class Repository {
             }
         }
     }
+
+    void restore_working_directory(const std::string& branch,
                                    const std::set<std::string>& files_to_clear) {
         std::string target_commit_hash = get_branch_commit(branch);
         if (target_commit_hash.empty()) return;
@@ -835,6 +958,8 @@ class Repository {
 
         save_index({});
     }
+
+    std::string find_common_ancestor(const std::string& current_hash,
                                      const std::string& target_hash) {
         std::set<std::string> current_ancestors;
         std::vector<std::string> pending{current_hash};
@@ -858,6 +983,9 @@ class Repository {
         }
         return "";
     }
+
+    void write_working_files(
+        const std::map<std::string, std::string>& files,
         const std::set<std::string>& files_to_clear) {
         for (const auto& fp : files_to_clear) {
             fs::path path = repo_path / fp;
@@ -871,6 +999,7 @@ class Repository {
             write_file_bytes(path, load_object(hash).content);
         }
     }
+
     bool merge(const std::string& target_branch) {
         std::string current_branch = get_current_branch();
         std::string current_hash = get_branch_commit(current_branch);
@@ -1001,6 +1130,50 @@ class Repository {
         std::cout << "Merge made commit " << merge_hash << std::endl;
         return true;
     }
+
+    void do_branch(const std::string& branch_name, bool do_delete) {
+        if (do_delete && !branch_name.empty()) {
+            fs::path branch_file = heads_dir / branch_name;
+            if (fs::exists(branch_file)) {
+                fs::remove(branch_file);
+                std::cout << "Deleted branch " << branch_name << std::endl;
+            } else {
+                std::cout << "Branch " << branch_name << " not found"
+                          << std::endl;
+            }
+            return;
+        }
+
+        std::string current_branch = get_current_branch();
+
+        if (!branch_name.empty()) {
+            std::string current_commit = get_branch_commit(current_branch);
+            if (!current_commit.empty()) {
+                set_branch_commit(branch_name, current_commit);
+                std::cout << "Created branch " << branch_name << std::endl;
+            } else {
+                std::cout << "No commits yet, cannot create a new branch"
+                          << std::endl;
+            }
+        } else {
+            std::vector<std::string> branches;
+            if (fs::exists(heads_dir)) {
+                for (const auto& entry : fs::directory_iterator(heads_dir)) {
+                    if (entry.is_regular_file() &&
+                        entry.path().filename().string()[0] != '.') {
+                        branches.push_back(entry.path().filename().string());
+                    }
+                }
+            }
+            std::sort(branches.begin(), branches.end());
+
+            for (const auto& b : branches) {
+                std::string marker = (b == current_branch) ? "* " : "  ";
+                std::cout << marker << b << std::endl;
+            }
+        }
+    }
+
     void log(int max_count = 10) {
         std::string current_branch = get_current_branch();
         std::string commit_hash = get_branch_commit(current_branch);
@@ -1026,6 +1199,29 @@ class Repository {
             ++count;
         }
     }
+
+    std::vector<fs::path> get_all_files() {
+        std::vector<fs::path> files;
+        for (const auto& entry :
+             fs::recursive_directory_iterator(repo_path)) {
+            if (!entry.is_regular_file()) continue;
+
+            bool in_git = false;
+            for (const auto& component : entry.path()) {
+                if (component.string() == ".git") {
+                    in_git = true;
+                    break;
+                }
+            }
+            if (in_git) continue;
+
+            files.push_back(entry.path());
+        }
+        return files;
+    }
+
+    // Status is the comparison between the committed tree, index, and files
+    // on disk. An empty index falls back to the committed version of a path.
     void status() {
         std::string current_branch = get_current_branch();
         std::cout << "On branch " << current_branch << std::endl;
@@ -1158,123 +1354,185 @@ class Repository {
                       << std::endl;
         }
     }
-    std::string get_current_branch() {
-        if (!fs::exists(head_file)) return "master";
+};
 
-        std::string head_content = trim(read_file_text(head_file));
-        std::string prefix = "ref: refs/heads/";
-        if (head_content.size() >= prefix.size() &&
-            head_content.substr(0, prefix.size()) == prefix) {
-            return head_content.substr(prefix.size());
-        }
-        return "HEAD";  // Detached HEAD state
+// CLI
+
+// Hand-rolled parsing is plenty for this command set and avoids another
+// dependency.
+
+static void print_usage() {
+    std::cout << "CppGit - A simple git clone in C++\n\n"
+              << "Usage:\n"
+              << "  mygit init                          "
+              << "Initialize a new repository\n"
+              << "  mygit add <path> [<path> ...]       "
+              << "Add files to staging area\n"
+              << "  mygit commit -m <message>           "
+              << "Create a new commit\n"
+              << "  mygit checkout [-b] <branch>        "
+              << "Switch/create branch\n"
+              << "  mygit merge <branch>                "
+              << "Merge a branch into the current one\n"
+              << "  mygit branch [<name>] [-d]          "
+              << "List/create/delete branches\n"
+              << "  mygit log [-n <count>]              "
+              << "Show commit history\n"
+              << "  mygit status                        "
+              << "Show repository status\n";
+}
+
+int main(int argc, char* argv[]) {
+    if (argc < 2) {
+        print_usage();
+        return 0;
     }
-    std::string get_branch_commit(const std::string& branch) {
-        fs::path branch_file = heads_dir / branch;
-        if (fs::exists(branch_file)) {
-            return trim(read_file_text(branch_file));
-        }
-        return "";
-    }
-    void set_branch_commit(const std::string& branch,
-    std::string do_commit(const std::string& message,
-    bool require_clean_working_tree(const std::string& operation) {
-        auto dirty_files = get_dirty_files();
-        if (dirty_files.empty()) return true;
 
-        std::cerr << "error: Your local changes to the following files "
-                     "would be overwritten by " << operation << ":"
-                  << std::endl;
-        for (const auto& fp : dirty_files) {
-            std::cerr << "    " << fp << std::endl;
-        }
-        std::cerr << "Please commit your changes or stash them before you "
-                     "continue." << std::endl;
-        return false;
-    }
-    void checkout(const std::string& branch, bool create_branch) {
-        std::string previous_branch = get_current_branch();
-        std::string previous_commit_hash = get_branch_commit(previous_branch);
-        auto committed_files = files_for_commit(previous_commit_hash);
-        std::set<std::string> files_to_clear;
-        for (const auto& [fp, hash] : committed_files) {
-            (void)hash;
-            files_to_clear.insert(fp);
-        }
+    std::string command = argv[1];
+    Repository repo;
 
-        if (!require_clean_working_tree("checkout")) return;
+    try {
+        if (command == "init") {
+            if (!repo.init()) {
+                std::cout << "Repository already exists" << std::endl;
+            }
+        }
+        else if (command == "add") {
+            if (!fs::exists(repo.git_dir)) {
+                std::cout << "Not a git repository" << std::endl;
+                return 1;
+            }
+            if (argc < 3) {
+                std::cerr << "Error: 'add' requires at least one path"
+                          << std::endl;
+                return 1;
+            }
+            for (int i = 2; i < argc; ++i) {
+                repo.add_path(argv[i]);
+            }
+        }
+        else if (command == "commit") {
+            if (!fs::exists(repo.git_dir)) {
+                std::cout << "Not a git repository" << std::endl;
+                return 1;
+            }
 
-        fs::path branch_file = heads_dir / branch;
-        if (!fs::exists(branch_file)) {
-            if (create_branch) {
-                if (!previous_commit_hash.empty()) {
-                    set_branch_commit(branch, previous_commit_hash);
-                    std::cout << "Created new branch " << branch << std::endl;
-                } else {
-                    std::cout << "No commits yet, cannot create a branch"
-                              << std::endl;
-                    return;
+            std::string message;
+            std::string author = "CppGit User <user@cppgit.com>";
+
+            for (int i = 2; i < argc; ++i) {
+                std::string arg = argv[i];
+                if ((arg == "-m" || arg == "--message") && i + 1 < argc) {
+                    message = argv[++i];
+                } else if (arg == "--author" && i + 1 < argc) {
+                    author = argv[++i];
                 }
-            } else {
-                std::cout << "Branch '" << branch << "' not found."
-                          << std::endl;
-                std::cout << "Use './mygit checkout -b " << branch
-                          << "' to create and switch to a new branch."
-                          << std::endl;
-                return;
             }
+
+            if (message.empty()) {
+                std::cerr << "Error: commit requires -m <message>"
+                          << std::endl;
+                return 1;
+            }
+
+            repo.do_commit(message, author);
         }
-
-        write_file_text(head_file, "ref: refs/heads/" + branch + "\n");
-
-        restore_working_directory(branch, files_to_clear);
-        std::cout << "Switched to branch " << branch << std::endl;
-    }
-    void restore_working_directory(const std::string& branch,
-    void do_branch(const std::string& branch_name, bool do_delete) {
-        if (do_delete && !branch_name.empty()) {
-            fs::path branch_file = heads_dir / branch_name;
-            if (fs::exists(branch_file)) {
-                fs::remove(branch_file);
-                std::cout << "Deleted branch " << branch_name << std::endl;
-            } else {
-                std::cout << "Branch " << branch_name << " not found"
-                          << std::endl;
+        else if (command == "checkout") {
+            if (!fs::exists(repo.git_dir)) {
+                std::cout << "Not a git repository" << std::endl;
+                return 1;
             }
-            return;
+
+            bool create_branch = false;
+            std::string branch_name;
+
+            for (int i = 2; i < argc; ++i) {
+                std::string arg = argv[i];
+                if (arg == "-b" || arg == "--create-branch") {
+                    create_branch = true;
+                } else {
+                    branch_name = arg;
+                }
+            }
+
+            if (branch_name.empty()) {
+                std::cerr << "Error: checkout requires a branch name"
+                          << std::endl;
+                return 1;
+            }
+
+            repo.checkout(branch_name, create_branch);
         }
-
-        std::string current_branch = get_current_branch();
-
-        if (!branch_name.empty()) {
-            std::string current_commit = get_branch_commit(current_branch);
-            if (!current_commit.empty()) {
-                set_branch_commit(branch_name, current_commit);
-                std::cout << "Created branch " << branch_name << std::endl;
-            } else {
-                std::cout << "No commits yet, cannot create a new branch"
-                          << std::endl;
+        else if (command == "merge") {
+            if (!fs::exists(repo.git_dir)) {
+                std::cout << "Not a git repository" << std::endl;
+                return 1;
             }
-        } else {
-            std::vector<std::string> branches;
-            if (fs::exists(heads_dir)) {
-                for (const auto& entry : fs::directory_iterator(heads_dir)) {
-                    if (entry.is_regular_file() &&
-                        entry.path().filename().string()[0] != '.') {
-                        branches.push_back(entry.path().filename().string());
+            if (argc != 3) {
+                std::cerr << "Error: merge requires a branch name" << std::endl;
+                return 1;
+            }
+            if (!repo.merge(argv[2])) return 1;
+        }
+        else if (command == "branch") {
+            if (!fs::exists(repo.git_dir)) {
+                std::cout << "Not a git repository" << std::endl;
+                return 1;
+            }
+
+            std::string branch_name;
+            bool do_delete = false;
+
+            for (int i = 2; i < argc; ++i) {
+                std::string arg = argv[i];
+                if (arg == "-d" || arg == "--delete") {
+                    do_delete = true;
+                } else {
+                    branch_name = arg;
+                }
+            }
+
+            repo.do_branch(branch_name, do_delete);
+        }
+        else if (command == "log") {
+            if (!fs::exists(repo.git_dir)) {
+                std::cout << "Not a git repository" << std::endl;
+                return 1;
+            }
+
+            int max_count = 10;
+
+            for (int i = 2; i < argc; ++i) {
+                std::string arg = argv[i];
+                if ((arg == "-n" || arg == "--max-count") && i + 1 < argc) {
+                    try {
+                        max_count = std::stoi(argv[++i]);
+                    } catch (...) {
+                        std::cerr << "Error: invalid number for -n"
+                                  << std::endl;
+                        return 1;
                     }
                 }
             }
-            std::sort(branches.begin(), branches.end());
 
-            for (const auto& b : branches) {
-                std::string marker = (b == current_branch) ? "* " : "  ";
-                std::cout << marker << b << std::endl;
-            }
+            repo.log(max_count);
         }
+        else if (command == "status") {
+            if (!fs::exists(repo.git_dir)) {
+                std::cout << "Not a git repository" << std::endl;
+                return 1;
+            }
+            repo.status();
+        }
+        else {
+            std::cerr << "Unknown command: " << command << std::endl;
+            print_usage();
+            return 1;
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return 1;
     }
-};
 
-int main(int argc, char* argv[]) {
     return 0;
 }
