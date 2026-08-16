@@ -1158,6 +1158,121 @@ class Repository {
                       << std::endl;
         }
     }
+    std::string get_current_branch() {
+        if (!fs::exists(head_file)) return "master";
+
+        std::string head_content = trim(read_file_text(head_file));
+        std::string prefix = "ref: refs/heads/";
+        if (head_content.size() >= prefix.size() &&
+            head_content.substr(0, prefix.size()) == prefix) {
+            return head_content.substr(prefix.size());
+        }
+        return "HEAD";  // Detached HEAD state
+    }
+    std::string get_branch_commit(const std::string& branch) {
+        fs::path branch_file = heads_dir / branch;
+        if (fs::exists(branch_file)) {
+            return trim(read_file_text(branch_file));
+        }
+        return "";
+    }
+    void set_branch_commit(const std::string& branch,
+    std::string do_commit(const std::string& message,
+    bool require_clean_working_tree(const std::string& operation) {
+        auto dirty_files = get_dirty_files();
+        if (dirty_files.empty()) return true;
+
+        std::cerr << "error: Your local changes to the following files "
+                     "would be overwritten by " << operation << ":"
+                  << std::endl;
+        for (const auto& fp : dirty_files) {
+            std::cerr << "    " << fp << std::endl;
+        }
+        std::cerr << "Please commit your changes or stash them before you "
+                     "continue." << std::endl;
+        return false;
+    }
+    void checkout(const std::string& branch, bool create_branch) {
+        std::string previous_branch = get_current_branch();
+        std::string previous_commit_hash = get_branch_commit(previous_branch);
+        auto committed_files = files_for_commit(previous_commit_hash);
+        std::set<std::string> files_to_clear;
+        for (const auto& [fp, hash] : committed_files) {
+            (void)hash;
+            files_to_clear.insert(fp);
+        }
+
+        if (!require_clean_working_tree("checkout")) return;
+
+        fs::path branch_file = heads_dir / branch;
+        if (!fs::exists(branch_file)) {
+            if (create_branch) {
+                if (!previous_commit_hash.empty()) {
+                    set_branch_commit(branch, previous_commit_hash);
+                    std::cout << "Created new branch " << branch << std::endl;
+                } else {
+                    std::cout << "No commits yet, cannot create a branch"
+                              << std::endl;
+                    return;
+                }
+            } else {
+                std::cout << "Branch '" << branch << "' not found."
+                          << std::endl;
+                std::cout << "Use './mygit checkout -b " << branch
+                          << "' to create and switch to a new branch."
+                          << std::endl;
+                return;
+            }
+        }
+
+        write_file_text(head_file, "ref: refs/heads/" + branch + "\n");
+
+        restore_working_directory(branch, files_to_clear);
+        std::cout << "Switched to branch " << branch << std::endl;
+    }
+    void restore_working_directory(const std::string& branch,
+    void do_branch(const std::string& branch_name, bool do_delete) {
+        if (do_delete && !branch_name.empty()) {
+            fs::path branch_file = heads_dir / branch_name;
+            if (fs::exists(branch_file)) {
+                fs::remove(branch_file);
+                std::cout << "Deleted branch " << branch_name << std::endl;
+            } else {
+                std::cout << "Branch " << branch_name << " not found"
+                          << std::endl;
+            }
+            return;
+        }
+
+        std::string current_branch = get_current_branch();
+
+        if (!branch_name.empty()) {
+            std::string current_commit = get_branch_commit(current_branch);
+            if (!current_commit.empty()) {
+                set_branch_commit(branch_name, current_commit);
+                std::cout << "Created branch " << branch_name << std::endl;
+            } else {
+                std::cout << "No commits yet, cannot create a new branch"
+                          << std::endl;
+            }
+        } else {
+            std::vector<std::string> branches;
+            if (fs::exists(heads_dir)) {
+                for (const auto& entry : fs::directory_iterator(heads_dir)) {
+                    if (entry.is_regular_file() &&
+                        entry.path().filename().string()[0] != '.') {
+                        branches.push_back(entry.path().filename().string());
+                    }
+                }
+            }
+            std::sort(branches.begin(), branches.end());
+
+            for (const auto& b : branches) {
+                std::string marker = (b == current_branch) ? "* " : "  ";
+                std::cout << marker << b << std::endl;
+            }
+        }
+    }
 };
 
 int main(int argc, char* argv[]) {
